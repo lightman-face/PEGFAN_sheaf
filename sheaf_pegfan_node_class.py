@@ -22,8 +22,7 @@ def parse_args():
     parser.add_argument('--patience', type=int, default=50)
     parser.add_argument('--hidden', type=int, default=64)
     parser.add_argument('--token-budget', type=int, default=512)
-    parser.add_argument('--cluster-size', type=int, default=4)
-    parser.add_argument('--residual-quantile', type=float, default=0.75)
+    parser.add_argument('--disconnected-policy', choices=['virtual_root', 'forest'], default='virtual_root')
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument('--transformer-layers', type=int, default=2)
     parser.add_argument('--sheaf-rank', type=int, default=16)
@@ -60,7 +59,7 @@ def train(args):
         raise ValueError('train/validation/test masks must be disjoint')
     model = SheafHaarTransformer(
         nfeat, args.hidden, nclass, token_budget=args.token_budget,
-        max_cluster_size=args.cluster_size, residual_quantile=args.residual_quantile,
+        disconnected_policy=args.disconnected_policy,
         nhead=args.heads, transformer_layers=args.transformer_layers,
         sheaf_rank=args.sheaf_rank, dropout=args.dropout,
     ).to(device).set_graph(adjacency)
@@ -106,7 +105,9 @@ def train(args):
     hierarchy = model.hierarchy
     result = dict(best_epoch=best_epoch, validation_accuracy=best_accuracy,
                   test_accuracy=test_accuracy, node_counts=hierarchy.node_counts,
-                  token_level=hierarchy.token_level, virtual_merge_levels=hierarchy.virtual_merge_levels)
+                  token_level=hierarchy.token_level, virtual_merge_levels=hierarchy.virtual_merge_levels,
+                  tokens=hierarchy.num_tokens, num_components=hierarchy.filtration.num_components,
+                  full_filtration_events=len(hierarchy.filtration.event_counts))
     print(f'Best epoch={best_epoch} val_acc={best_accuracy:.4f} test_acc={test_accuracy:.4f}')
     print(f'Hierarchy={hierarchy.node_counts}; token_level={hierarchy.token_level}; '
           f'virtual_merge_levels={hierarchy.virtual_merge_levels}')

@@ -379,10 +379,11 @@ def get_spatial_framelets_list(adj, dataset, h = 4):
 def haar_pool_details(signal, projections):
     """Pool through orthonormal assignments, preserving each discarded detail.
 
-    P has one 1/sqrt(number_of_children) per row. For a parent's k children,
-    PEGFAN's pairwise Haar framelets have rows (e_i-e_j)/sqrt(k), hence
-    Psi.T @ Psi = I - P @ P.T. Computing that projection implicitly avoids
-    storing a dense framelet basis and handles singleton clusters exactly.
+    P has orthonormal columns; the filtration uses sqrt(child_mass/parent_mass).
+    The highpass projection is I - P @ P.T, applied without a dense matrix.
+    For equal child masses this equals PEGFAN's pairwise Haar projection.
+    Mass normalization also makes projection composition independent of skipped
+    levels. Singleton clusters contribute zero detail.
     """
     details = []
     for projection in projections:

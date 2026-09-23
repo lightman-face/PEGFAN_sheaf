@@ -25,7 +25,7 @@ def edge_residual_energy(features, adjacency, restriction=None, weighted=False):
     R_u = R_v = I. A callable restriction returns the two mapped endpoint
     vectors. By default scores are the raw squared residuals s_e; weighted=True
     retains the edge-weighted energy used by the initial single-level helper.
-    Pass raw scores to build_sheaf_hierarchy, which weights boundary averages.
+    Pass raw scores to build_sheaf_hierarchy; it uses q = -residual.
     """
     features = np.asarray(features, dtype=np.float32)
     adjacency = _as_symmetric_adjacency(adjacency)
@@ -70,7 +70,7 @@ def adaptive_partition(
     residual_quantile=0.75,
     min_clusters=1,
 ):
-    """Build a residual-aware partition using low-residual edges first.
+    """Legacy greedy helper (not used by the filtration model).
 
     High-residual edges are protected from early merging. The greedy rule is
     deterministic and intentionally non-learned for controlled ablations.
@@ -141,58 +141,262 @@ def build_coarse_graph(adjacency, assignment):
     return projection, coarse_adjacency
 
 
+def _positive_integer(value, name):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+
+
+@dataclass
+class MergeFiltration:
+    """Budget-independent, multiway merge forest; IDs are not semantic labels."""
+
+    num_nodes: int
+    children: list
+    parent: np.ndarray
+    masses: np.ndarray
+    birth_events: np.ndarray
+    event_counts: np.ndarray
+    thresholds: np.ndarray
+    roots: tuple
+    num_components: int
+    virtual_event: object = None
+
+    def partition(self, event):
+        """Materialize one leaf partition in O(n), primarily for diagnostics."""
+        if not isinstance(event, (int, np.integer)) or not 0 <= event < len(self.event_counts):
+            raise ValueError("invalid filtration event")
+        blocks, stack = [], list(self.roots)
+        while stack:
+            node = stack.pop()
+            if self.birth_events[node] <= event:
+                blocks.append(node)
+            else:
+                stack.extend(self.children[node])
+        assignment = np.empty(self.num_nodes, dtype=np.int64)
+        for label, root in enumerate(blocks):
+            stack = [root]
+            while stack:
+                node = stack.pop()
+                if node < self.num_nodes:
+                    assignment[node] = label
+                else:
+                    stack.extend(self.children[node])
+        return assignment
+
+
+@dataclass
+class HierarchySelection:
+    events: tuple
+    token_level: int
+    token_budget: int
+
+
 @dataclass
 class SheafHierarchy:
-    """Fine-to-coarse partitions; features stop at ``token_level``.
-
-    The remaining partitions form Haar bands *on* the token graph. Projection
-    columns are orthonormal, so their transposes pool and the same matrices lift.
-    """
-
     assignments: list
     projections: list
-    adjacencies: list
+    node_counts: list
+    masses: list
+    cluster_nodes: list
     token_level: int
     virtual_merge_levels: list
-
-    @property
-    def node_counts(self):
-        return [adj.shape[0] for adj in self.adjacencies]
+    filtration: MergeFiltration
+    selection: HierarchySelection
 
     @property
     def num_tokens(self):
         return self.node_counts[self.token_level]
 
 
-def build_sheaf_hierarchy(
-    adjacency, edge_sources, edge_targets, edge_residual,
-    token_budget=512, max_cluster_size=4, residual_quantile=0.75,
-):
-    """Merge low-residual neighbors first, stopping feature pooling at budget.
+def build_sheaf_filtration(num_nodes, edge_sources, edge_targets, merge_scores,
+                           disconnected_policy="virtual_root"):
+    """Threshold CCs with complete tie batches and no child-count constraint.
 
-    Residuals are unweighted squared sheaf differences, one per undirected
-    edge. Coarse boundary scores are edge-weighted means of those original
-    residuals, rather than differences of pooled features (which can cancel).
-    High scores delay merging, but cannot forbid it under a hard token cap.
-
-    If only disconnected regions remain, deterministic virtual groups ensure
-    the cap and a complete Haar hierarchy. These add no graph edges and are
-    reported in ``virtual_merge_levels``. Equal scores use input-index order;
-    exact permutation equivariance is not guaranteed for such ties.
+    Larger scores merge earlier. Scores remain fixed for the entire build.
+    Parallel edges are allowed; self-loops have no effect. Only changed CC
+    partitions are recorded, as a compact multiway tree, never n-by-events
+    assignments. A virtual root groups ALL final components simultaneously.
     """
-    if not isinstance(token_budget, (int, np.integer)) or token_budget < 1:
-        raise ValueError("token_budget must be a positive integer")
-    if not isinstance(max_cluster_size, (int, np.integer)) or max_cluster_size < 2:
-        raise ValueError("max_cluster_size must be an integer >= 2")
-    if not 0 <= residual_quantile <= 1:
-        raise ValueError("residual_quantile must be between 0 and 1")
+    _positive_integer(num_nodes, "num_nodes")
+    if disconnected_policy not in ("virtual_root", "forest"):
+        raise ValueError("disconnected_policy must be virtual_root or forest")
+    sources, targets = np.asarray(edge_sources), np.asarray(edge_targets)
+    scores = np.asarray(merge_scores, dtype=np.float64)
+    if sources.ndim != 1 or sources.shape != targets.shape or sources.shape != scores.shape:
+        raise ValueError("edges and scores must be equally sized vectors")
+    if len(sources) and (not np.issubdtype(sources.dtype, np.integer)
+                         or not np.issubdtype(targets.dtype, np.integer)):
+        raise ValueError("edge endpoints must be integers")
+    sources, targets = sources.astype(np.int64), targets.astype(np.int64)
+    if ((sources < 0).any() or (sources >= num_nodes).any()
+            or (targets < 0).any() or (targets >= num_nodes).any()):
+        raise ValueError("edge endpoint outside node range")
+    if not np.isfinite(scores).all():
+        raise ValueError("merge scores must be finite")
+
+    # Python integers avoid NumPy scalar overhead in the sequential UF loop.
+    source_list, target_list = sources.tolist(), targets.tolist()
+    uf_parent = list(range(num_nodes))
+    uf_size = [1] * num_nodes
+    component_node = list(range(num_nodes))
+    children = [()] * num_nodes
+    parent, mass, birth = [-1] * num_nodes, [1] * num_nodes, [0] * num_nodes
+    counts, thresholds = [num_nodes], [np.inf]
+    count = num_nodes
+
+    def find(node):
+        while uf_parent[node] != node:
+            uf_parent[node] = uf_parent[uf_parent[node]]
+            node = uf_parent[node]
+        return int(node)
+
+    order = np.argsort(-scores, kind="stable")
+    sorted_scores = scores[order]
+    starts = np.r_[0, np.flatnonzero(sorted_scores[1:] != sorted_scores[:-1]) + 1, len(order)].tolist()
+    order = order.tolist()
+    for start, end in zip(starts[:-1], starts[1:]):
+        if start == end:
+            continue
+        # Remember the OLD tree nodes; sequential UF operations are internal
+        # bookkeeping, not binary nodes exposed to the Haar hierarchy.
+        touched = {}
+        for index in order[start:end]:
+            first, second = find(source_list[index]), find(target_list[index])
+            if first == second:
+                continue
+            touched.setdefault(first, int(component_node[first]))
+            touched.setdefault(second, int(component_node[second]))
+            if uf_size[first] < uf_size[second]:
+                first, second = second, first
+            uf_parent[second] = first
+            uf_size[first] += uf_size[second]
+            count -= 1
+        if not touched:
+            continue
+        groups = {}
+        for old_root, tree_node in touched.items():
+            groups.setdefault(find(old_root), []).append(tree_node)
+        event = len(counts)
+        for root, group in groups.items():
+            node = len(children)
+            children.append(tuple(group))
+            mass.append(sum(mass[child] for child in group))
+            birth.append(event)
+            parent.append(-1)
+            for child in group:
+                parent[child] = node
+            component_node[root] = node
+        counts.append(count)
+        thresholds.append(float(scores[order[start]]))
+        if count == 1:
+            break
+
+    roots = tuple(int(component_node[i]) for i in range(num_nodes) if uf_parent[i] == i)
+    num_components = len(roots)
+    virtual_event = None
+    if num_components > 1 and disconnected_policy == "virtual_root":
+        virtual_event = len(counts)
+        node = len(children)
+        children.append(roots)
+        parent.append(-1)
+        mass.append(num_nodes)
+        birth.append(virtual_event)
+        for child in roots:
+            parent[child] = node
+        roots = (node,)
+        counts.append(1)
+        thresholds.append(-np.inf)
+    return MergeFiltration(num_nodes, children, np.asarray(parent), np.asarray(mass),
+                           np.asarray(birth), np.asarray(counts), np.asarray(thresholds),
+                           roots, num_components, virtual_event)
+
+
+def select_hierarchy_levels(filtration, token_budget=512):
+    """Finest budget-feasible cut, with dyadic local and global level queries."""
+    _positive_integer(token_budget, "token_budget")
+    counts = filtration.event_counts
+    if counts[-1] > token_budget:
+        raise ValueError(f"budget {token_budget} is unreachable: graph has "
+                         f"{filtration.num_components} connected components; "
+                         "use virtual_root or increase the budget")
+
+    def first_at_most(target):
+        return int(np.searchsorted(-counts, -target, side="left"))
+
+    cut = first_at_most(token_budget)
+    events = {0, cut}
+    target = filtration.num_nodes // 2
+    while target >= 1:
+        event = first_at_most(target)
+        if event >= cut:
+            break
+        events.add(event)
+        target //= 2
+    target = int(counts[cut]) // 2
+    terminal = int(counts[-1])
+    while target >= terminal:
+        events.add(first_at_most(target))
+        target //= 2
+    events.add(len(counts) - 1)
+    events = tuple(sorted(events))
+    return HierarchySelection(events, events.index(cut), int(token_budget))
+
+
+def materialize_projections(filtration, selection):
+    """Mass-normalized projections only at selected events.
+
+    Internal merge nodes are visited once as the active cut advances. Between
+    consecutive selected cuts, tree traversal stops at the previous cut, so
+    skipped levels do not require full original-node assignment snapshots.
+    """
+    if not selection.events or selection.events[0] != 0:
+        raise ValueError("selection must start at the singleton partition")
+    active = set(range(filtration.num_nodes))
+    fine = np.arange(filtration.num_nodes, dtype=np.int64)
+    cursor = filtration.num_nodes
+    assignments, projections = [], []
+    clusters, masses = [fine], [filtration.masses[fine]]
+    virtual_levels = []
+    for level, event in enumerate(selection.events[1:]):
+        while cursor < len(filtration.children) and filtration.birth_events[cursor] <= event:
+            active.difference_update(filtration.children[cursor])
+            active.add(cursor)
+            cursor += 1
+        coarse = np.fromiter(active, dtype=np.int64, count=len(active))
+        fine_index = {int(node): index for index, node in enumerate(fine)}
+        assignment = np.empty(len(fine), dtype=np.int64)
+        for label, root in enumerate(coarse):
+            stack = [int(root)]
+            while stack:
+                node = stack.pop()
+                index = fine_index.get(node)
+                if index is not None:
+                    assignment[index] = label
+                else:
+                    stack.extend(filtration.children[node])
+        fine_mass, coarse_mass = filtration.masses[fine], filtration.masses[coarse]
+        values = np.sqrt(fine_mass / coarse_mass[assignment]).astype(np.float32)
+        projection = sp.csr_matrix((values, (np.arange(len(fine)), assignment)),
+                                   shape=(len(fine), len(coarse)))
+        if (filtration.virtual_event is not None
+                and selection.events[level] < filtration.virtual_event <= event):
+            virtual_levels.append(level)
+        assignments.append(assignment)
+        projections.append(projection)
+        clusters.append(coarse)
+        masses.append(coarse_mass)
+        fine = coarse
+    return SheafHierarchy(assignments, projections, [len(c) for c in clusters], masses,
+                          clusters, selection.token_level, virtual_levels, filtration, selection)
+
+
+def build_sheaf_hierarchy(adjacency, edge_sources, edge_targets, edge_residual,
+                           token_budget=512, disconnected_policy="virtual_root"):
+    """Convenience wrapper: nonnegative sheaf energies become q=-energy."""
     adjacency = _as_symmetric_adjacency(adjacency)
-    n = adjacency.shape[0]
-    if not n:
-        raise ValueError("cannot build a hierarchy for an empty graph")
-    sources = np.asarray(edge_sources, dtype=np.int64)
-    targets = np.asarray(edge_targets, dtype=np.int64)
-    residual = np.asarray(edge_residual, dtype=np.float32)
+    sources = np.array(edge_sources, dtype=np.int64, copy=True)
+    targets = np.array(edge_targets, dtype=np.int64, copy=True)
+    residual = np.asarray(edge_residual)
     expected_sources, expected_targets = sp.triu(adjacency, k=1).nonzero()
     if (sources.shape != targets.shape or sources.shape != residual.shape
             or not np.array_equal(sources, expected_sources)
@@ -200,52 +404,6 @@ def build_sheaf_hierarchy(
         raise ValueError("residuals must follow the upper-triangular adjacency edge order")
     if not np.isfinite(residual).all() or (residual < 0).any():
         raise ValueError("edge residuals must be finite and nonnegative")
-    weights = np.asarray(adjacency[sources, targets]).reshape(-1) if len(sources) else np.empty(0)
-    energy = sp.csr_matrix((weights * residual, (sources, targets)), shape=(n, n))
-    energy = energy + energy.T
-    boundary_weights = adjacency.copy()
-    hierarchy = SheafHierarchy([], [], [adjacency], 0 if n <= token_budget else -1, [])
-
-    while adjacency.shape[0] > 1:
-        n = adjacency.shape[0]
-        rows, cols = sp.triu(boundary_weights, k=1).nonzero()
-        if len(rows):
-            weight = np.asarray(boundary_weights[rows, cols]).reshape(-1)
-            scores = np.asarray(energy[rows, cols]).reshape(-1) / np.maximum(weight, 1e-30)
-        else:
-            scores = np.empty(0, dtype=np.float32)
-        min_clusters = token_budget if hierarchy.token_level < 0 else 1
-        assignment = adaptive_partition(
-            adjacency, rows, cols, scores, max_cluster_size,
-            residual_quantile, min_clusters=min_clusters,
-        )
-        if assignment.max() + 1 == n:
-            if len(rows):
-                assignment = adaptive_partition(
-                    adjacency, rows, cols, scores, max_cluster_size,
-                    1.0, min_clusters=min_clusters,
-                )
-            else:
-                # No graph edges remain: group components only as a last resort.
-                target_count = max(min_clusters, (n + max_cluster_size - 1) // max_cluster_size)
-                assignment = np.arange(n, dtype=np.int64) * target_count // n
-                hierarchy.virtual_merge_levels.append(len(hierarchy.projections))
-
-        projection, coarse_adjacency = build_coarse_graph(adjacency, assignment)
-        membership = sp.csr_matrix(
-            (np.ones(n, dtype=np.float32), (np.arange(n), assignment)),
-            shape=projection.shape,
-        )
-        boundary_weights = (membership.T @ boundary_weights @ membership).tocsr()
-        energy = (membership.T @ energy @ membership).tocsr()
-        for matrix in (boundary_weights, energy):
-            matrix.setdiag(0)
-            matrix.eliminate_zeros()
-        hierarchy.assignments.append(assignment)
-        hierarchy.projections.append(projection)
-        hierarchy.adjacencies.append(coarse_adjacency)
-        adjacency = coarse_adjacency
-        if hierarchy.token_level < 0 and adjacency.shape[0] <= token_budget:
-            hierarchy.token_level = len(hierarchy.projections)
-
-    return hierarchy
+    filtration = build_sheaf_filtration(adjacency.shape[0], sources, targets, -residual,
+                                        disconnected_policy)
+    return materialize_projections(filtration, select_hierarchy_levels(filtration, token_budget))

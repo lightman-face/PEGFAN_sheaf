@@ -4,7 +4,10 @@ import math
 import numpy as np
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from sheaf_coarsening import _as_symmetric_adjacency, build_sheaf_hierarchy
+from sheaf_coarsening import (
+    _as_symmetric_adjacency, build_sheaf_filtration,
+    select_hierarchy_levels, materialize_projections,
+)
 from framelets_utils import haar_pool_details, haar_lift, haar_framelet_projections
 from utils import sparse_mx_to_torch_sparse_tensor
 import scipy.sparse as sp
@@ -153,18 +156,19 @@ class SheafHaarTransformer(nn.Module):
     """
 
     def __init__(self, nfeat, nhidden, nclass, token_budget=512,
-                 max_cluster_size=4, residual_quantile=0.75,
+                 disconnected_policy="virtual_root",
                  nhead=4, transformer_layers=2, sheaf_rank=16, dropout=0.5):
         super().__init__()
         if nhead < 1 or nhidden < 1 or nhidden % nhead:
             raise ValueError("nhidden must be positive and divisible by nhead")
-        if token_budget < 1 or max_cluster_size < 2 or transformer_layers < 1 or sheaf_rank < 1:
-            raise ValueError("budget/layers/rank must be positive and cluster size >= 2")
-        if not 0 <= residual_quantile <= 1:
-            raise ValueError("residual_quantile must be between 0 and 1")
+        if token_budget < 1 or transformer_layers < 1 or sheaf_rank < 1:
+            raise ValueError("budget/layers/rank must be positive")
+        if isinstance(token_budget, bool) or not isinstance(token_budget, (int, np.integer)):
+            raise ValueError("token_budget must be a positive integer")
+        if disconnected_policy not in ("virtual_root", "forest"):
+            raise ValueError("invalid disconnected policy")
         self.token_budget = token_budget
-        self.max_cluster_size = max_cluster_size
-        self.residual_quantile = residual_quantile
+        self.disconnected_policy = disconnected_policy
         self.input_projection = nn.Linear(nfeat, nhidden)
         self.sheaf = LightweightSheaf(nhidden, sheaf_rank)
         # Sequence-first layout also works with the original PEGFAN torch 1.7.
@@ -184,6 +188,8 @@ class SheafHaarTransformer(nn.Module):
         self.register_buffer("edge_weights", torch.empty(0), persistent=False)
         self._adjacency = None
         self.hierarchy = None
+        self._torch_projections = None
+        self._projection_key = None
 
     def set_graph(self, adjacency):
         """Set an undirected, loop-free graph without densifying adjacency."""
@@ -197,6 +203,8 @@ class SheafHaarTransformer(nn.Module):
             dtype=self.input_projection.weight.dtype, device=device,
         )
         self.hierarchy = None
+        self._torch_projections = None
+        self._projection_key = None
         return self
 
     def forward(self, features, rebuild_hierarchy=True):
@@ -207,15 +215,22 @@ class SheafHaarTransformer(nn.Module):
         hidden = F.gelu(self.input_projection(features))
         local, residual = self.sheaf(hidden, self.edge_sources, self.edge_targets, self.edge_weights)
         if rebuild_hierarchy or self.hierarchy is None:
-            self.hierarchy = build_sheaf_hierarchy(
-                self._adjacency, self.edge_sources.cpu().numpy(), self.edge_targets.cpu().numpy(),
-                residual.detach().cpu().numpy(), token_budget=self.token_budget,
-                max_cluster_size=self.max_cluster_size, residual_quantile=self.residual_quantile,
+            filtration = build_sheaf_filtration(
+                len(features), self.edge_sources.cpu().numpy(), self.edge_targets.cpu().numpy(),
+                -residual.detach().cpu().numpy(), self.disconnected_policy,
             )
-        projections = [
-            sparse_mx_to_torch_sparse_tensor(p).to(device=features.device, dtype=hidden.dtype)
-            for p in self.hierarchy.projections
-        ]
+            self.hierarchy = materialize_projections(
+                filtration, select_hierarchy_levels(filtration, self.token_budget),
+            )
+            self._torch_projections = None
+        key = (features.device, hidden.dtype)
+        if self._torch_projections is None or key != self._projection_key:
+            self._torch_projections = [
+                sparse_mx_to_torch_sparse_tensor(p).to(device=features.device, dtype=hidden.dtype)
+                for p in self.hierarchy.projections
+            ]
+            self._projection_key = key
+        projections = self._torch_projections
         cut = self.hierarchy.token_level
         tokens, local_details = haar_pool_details(local, projections[:cut])
         if tokens.shape[0] > self.token_budget:

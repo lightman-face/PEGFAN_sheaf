@@ -1,0 +1,8 @@
+
+# Experiment outputs
+results/
+*.pt
+*.pth
+*.ckpt
+__pycache__/
+*.pyc
