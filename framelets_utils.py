@@ -1,6 +1,5 @@
 from scipy.cluster.hierarchy import dendrogram, linkage, fcluster
 from scipy.sparse.csgraph import shortest_path
-from sknetwork.hierarchy import Paris, LouvainHierarchy, Ward, cut_balanced
 import numpy as np
 import scipy.sparse as sp
 import scipy.io as io
@@ -19,6 +18,7 @@ def sparse_mx_to_torch_sparse_tensor(sparse_mx):
     return torch.sparse.FloatTensor(indices, values, shape)
 
 def get_spatial_partitions(adj, h = 4):
+    from sknetwork.hierarchy import Ward, cut_balanced
     
     print("=======Generating hierachical partitions======")
 
@@ -374,6 +374,46 @@ def get_spatial_framelets_list(adj, dataset, h = 4):
             pickle.dump(framelets_list, fp)
 
     return framelets_list, framelets_T_list
+
+
+def haar_pool_details(signal, projections):
+    """Pool through orthonormal assignments, preserving each discarded detail.
+
+    P has one 1/sqrt(number_of_children) per row. For a parent's k children,
+    PEGFAN's pairwise Haar framelets have rows (e_i-e_j)/sqrt(k), hence
+    Psi.T @ Psi = I - P @ P.T. Computing that projection implicitly avoids
+    storing a dense framelet basis and handles singleton clusters exactly.
+    """
+    details = []
+    for projection in projections:
+        coarse = torch.sparse.mm(projection.transpose(0, 1), signal)
+        details.append(signal - torch.sparse.mm(projection, coarse))
+        signal = coarse
+    return signal, details
+
+
+def haar_lift(signal, projections, details=None):
+    """Lift a coarse signal, optionally restoring its saved Haar details."""
+    if details is not None and len(details) != len(projections):
+        raise ValueError("one detail signal is required per projection")
+    for level in reversed(range(len(projections))):
+        signal = torch.sparse.mm(projections[level], signal)
+        if details is not None:
+            signal = signal + details[level]
+    return signal
+
+
+def haar_framelet_projections(signal, projections):
+    """Return lowpass and scale-wise Psi.T @ Psi projections on input nodes.
+
+    Their sum reconstructs ``signal``. Applied to Transformer output, these
+    are multiscale signals on the token graph, using the hierarchy above its
+    budget cut. No second partition or precomputed feature channels are used.
+    """
+    lowpass, details = haar_pool_details(signal, projections)
+    bands = [haar_lift(lowpass, projections)]
+    bands.extend(haar_lift(detail, projections[:level]) for level, detail in enumerate(details))
+    return bands
 
 
             

@@ -4,7 +4,6 @@ import networkx as nx
 import numpy as np
 import scipy.sparse as sp
 import torch as th
-from sklearn.model_selection import ShuffleSplit
 from utils import sys_normalized_adjacency,sparse_mx_to_torch_sparse_tensor,sys_normalized_adjacency_i
 import pickle as pkl
 import sys
@@ -28,7 +27,7 @@ def sample_mask(idx, l):
     """Create mask."""
     mask = np.zeros(l)
     mask[idx] = 1
-    return np.array(mask, dtype=np.bool)
+    return np.array(mask, dtype=bool)
 
 
 def full_load_citation_and_synthetic(dataset_str):
@@ -58,7 +57,9 @@ def full_load_citation_and_synthetic(dataset_str):
 
     features = sp.vstack((allx, tx)).tolil()
     features[test_idx_reorder, :] = features[test_idx_range, :]
-    adj = nx.adjacency_matrix(nx.from_dict_of_lists(graph))
+    graph = nx.from_dict_of_lists(graph)
+    graph.add_nodes_from(range(features.shape[0]))
+    adj = nx.adjacency_matrix(graph, nodelist=range(features.shape[0]))
     
     labels = np.vstack((ally, ty))
     labels[test_idx_reorder, :] = labels[test_idx_range, :]
@@ -83,7 +84,7 @@ def full_load_citation_and_synthetic(dataset_str):
 
 def preprocess_features(features):
     """Row-normalize feature matrix and convert to tuple representation"""
-    rowsum = np.array(features.sum(1))
+    rowsum = np.asarray(features.sum(1), dtype=np.float32)
     rowsum = (rowsum==0)*1+rowsum
     r_inv = np.power(rowsum, -1).flatten()
     r_inv[np.isinf(r_inv)] = 0.
@@ -91,9 +92,9 @@ def preprocess_features(features):
     features = r_mat_inv.dot(features)
     return features
 
-def full_load_data(dataset_name, splits_file_path = None):
+def full_load_data(dataset_name, splits_file_path = None, return_sparse=False):
     if dataset_name in {'cora', 'citeseer', 'pubmed'}:
-        adj, features, labels, _, _, _ = full_load_citation(dataset_name)
+        adj, features, labels, _, _, _ = full_load_citation_and_synthetic(dataset_name)
         labels = np.argmax(labels, axis=-1)
         features = features.todense()
         G = nx.DiGraph(adj)
@@ -127,6 +128,10 @@ def full_load_data(dataset_name, splits_file_path = None):
                     assert (int(line[0]) not in graph_node_features_dict and int(line[0]) not in graph_labels_dict)
                     graph_node_features_dict[int(line[0])] = np.array(line[1].split(','), dtype=np.uint8)
                     graph_labels_dict[int(line[0])] = int(line[2])
+
+        # Preserve isolated nodes so graph, features and split masks stay aligned.
+        for node in sorted(graph_node_features_dict):
+            G.add_node(node, features=graph_node_features_dict[node], label=graph_labels_dict[node])
 
         with open(graph_adjacency_list_file_path) as graph_adjacency_list_file:
             graph_adjacency_list_file.readline()
@@ -169,4 +174,5 @@ def full_load_data(dataset_name, splits_file_path = None):
     adj = sparse_mx_to_torch_sparse_tensor(adj)
     adj_i = sparse_mx_to_torch_sparse_tensor(adj_i)
 
-    return g.todense(), adj, adj_i, features, labels, train_mask, val_mask, test_mask, num_features, num_labels
+    raw_graph = sp.csr_matrix(g) if return_sparse else g.todense()
+    return raw_graph, adj, adj_i, features, labels, train_mask, val_mask, test_mask, num_features, num_labels
