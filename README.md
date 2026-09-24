@@ -268,3 +268,33 @@ See the [architecture protocol](docs/architecture_augmentation_protocol.md) and
 split deltas, gate diagnostics and initialization/selected-checkpoint attention
 measurements. Existing experiment modules and earlier result artifacts are kept
 unchanged by this screen.
+
+
+### Fixed 36-run gradient-isolation matrix
+
+The next screen uses only Chameleon/Squirrel and splits 0–2: PEGFAN, T128,
+T128+Haar, their stop-gradient versions, and a frozen PEGFAN+T128+Haar.
+All branch variants share the same previously learned partition per split.
+The local PEGFAN is intact; Haar fusion retains a direct Transformer signal.
+
+Here stop-gradient means independent local CE plus fused CE with detached local
+logits. This is necessary because detaching a branch input or G alone does not
+remove the joint-loss influence on the backbone. Local parameter hashes are
+checked against the standalone PEGFAN trajectory at every warm-up epoch. Branch
+selection starts only once the reference backbone checkpoint is reached; the
+frozen variant starts from that checkpoint. Both admit the gate-zero baseline
+as a validation candidate. Raw and class-centered contribution ratios/cosines
+and gate-on/off predictions are recorded separately.
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/prepare_isolation_hierarchy.py
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python run_gradient_isolation.py
+# Add --resume for an existing run with identical sources and configuration.
+python scripts/analyze_gradient_isolation.py
+```
+
+See the [precise gradient/selection protocol](docs/gradient_isolation_protocol.md)
+and [36-run report](results/gradient_isolation/analysis.md). The requested strict
+ordering was not observed; stop-gradient runs selected the baseline, and the
+frozen branch produced only small gains. These global modules remain research
+options rather than an established accuracy contribution.
